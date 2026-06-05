@@ -1,0 +1,19 @@
+{
+  "task_labels": [
+    "Left",
+    "Right",
+    "Forward"
+  ],
+  "label_image_paths": {
+    "Left": "code/images/class_label_image/Left_20260605_205626.png",
+    "Right": "code/images/class_label_image/Right_20260605_205635.png",
+    "Forward": "code/images/class_label_image/Forward_20260605_205647.png"
+  },
+  "labels_saved": true,
+  "labels_confirmed": true,
+  "prep_s": 3.0,
+  "hold_s": 4.0,
+  "rest_s": 6.0,
+  "repeats": 5,
+  "record_rest": true
+}
