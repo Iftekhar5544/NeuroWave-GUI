@@ -1,0 +1,66 @@
+{
+  "created_at_text": "2026-04-19 15:40:53",
+  "accuracy": 1.0,
+  "weighted_f1": 1.0,
+  "cv_mean_accuracy": 1.0,
+  "cv_std_accuracy": 0.0,
+  "train_windows": 38,
+  "test_windows": 10,
+  "num_features": 279,
+  "classes": [
+    "Hand",
+    "No_hand"
+  ],
+  "class_window_counts": {
+    "Hand": 23,
+    "No_hand": 25
+  },
+  "segment_count_by_file": {
+    "dataset/Demo2_hand2_20_M_20260419_153733/eeg_data_Demo2_hand2_20_M_20260419_153733.csv": 10
+  },
+  "channel_count_by_file": {
+    "dataset/Demo2_hand2_20_M_20260419_153733/eeg_data_Demo2_hand2_20_M_20260419_153733.csv": 16
+  },
+  "input_channels": 16,
+  "confusion_matrix": [
+    [
+      5,
+      0
+    ],
+    [
+      0,
+      5
+    ]
+  ],
+  "classification_report_text": "              precision    recall  f1-score   support\n\n        Hand     1.0000    1.0000    1.0000         5\n     No_hand     1.0000    1.0000    1.0000         5\n\n    accuracy                         1.0000        10\n   macro avg     1.0000    1.0000    1.0000        10\nweighted avg     1.0000    1.0000    1.0000        10\n",
+  "classification_report_dict": {
+    "Hand": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 5.0
+    },
+    "No_hand": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 5.0
+    },
+    "accuracy": 1.0,
+    "macro avg": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 10.0
+    },
+    "weighted avg": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 10.0
+    }
+  },
+  "model_file": "eeg_realtime_model.joblib",
+  "run_dir": "trained_model/eeg_training_20260419_154053",
+  "model_path": "trained_model/eeg_training_20260419_154053/eeg_realtime_model.joblib"
+}

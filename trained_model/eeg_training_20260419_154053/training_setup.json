@@ -1,0 +1,18 @@
+{
+  "created_at_text": "2026-04-19 15:40:53",
+  "dataset_paths": [
+    "dataset/Demo2_hand2_20_M_20260419_153733/eeg_data_Demo2_hand2_20_M_20260419_153733.csv"
+  ],
+  "output_dir": "trained_model",
+  "run_name": "eeg_training",
+  "window_ms": 2000,
+  "stride_ms": 500,
+  "window_samples": 250,
+  "stride_samples": 62,
+  "n_estimators": 800,
+  "max_depth": 0,
+  "test_size": 0.2,
+  "random_seed": 42,
+  "sample_rate_hz": 125,
+  "input_channels": 16
+}

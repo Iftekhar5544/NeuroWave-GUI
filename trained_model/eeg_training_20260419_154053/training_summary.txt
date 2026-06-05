@@ -1,0 +1,9 @@
+Run Folder: trained_model/eeg_training_20260419_154053
+Model File: trained_model/eeg_training_20260419_154053/eeg_realtime_model.joblib
+Datasets: 1 file(s)
+Accuracy: 1.0000
+Weighted F1: 1.0000
+Train windows: 38 | Test windows: 10
+Window: 2000 ms (250 samples) | Stride: 500 ms (62 samples)
+Input channels: 16
+Classes: Hand, No_hand
