@@ -4,7 +4,7 @@ Desktop live-monitor and EEG machine-learning workflow app for `OpenBCI Cyton + 
 
 NeuroWave-EEG helps collect, visualize, label, train on, and run real-time predictions from 16-channel EEG streams. It also includes a BrainFlow synthetic-stream simulator for development without the physical board.
 
-## What v1 does
+## What This Project Provides
 
 - Lists available COM ports in a dropdown and lets you refresh them on demand
 - Starts and stops the BrainFlow stream
