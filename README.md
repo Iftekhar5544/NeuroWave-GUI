@@ -4,12 +4,13 @@ Desktop live-monitor and EEG machine-learning workflow app for `OpenBCI Cyton + 
 
 NeuroWave-EEG helps collect, visualize, label, train on, and run real-time predictions from 16-channel EEG streams. It also includes a BrainFlow synthetic-stream simulator for development without the physical board.
 
-## What This Project Provides
+## What v1 does
 
 - Lists available COM ports in a dropdown and lets you refresh them on demand
 - Starts and stops the BrainFlow stream
 - Displays 16 live EEG traces as a stacked scrolling graph
 - Includes real-time display filter controls (preset + custom high-pass, low-pass, and notch)
+- Includes a Cyton/Cyton+Daisy electrode impedance-check window for setup quality control
 - Includes an EEG ML pipeline window for labeled collection, model training, and real-time prediction
 - Supports optional class-label image cues during guided data-recording sessions
 - Keeps a fixed rolling window in memory for responsive plotting
@@ -56,8 +57,9 @@ python code/simulator_main.py
 5. Click `Start` to begin the live EEG stream.
 6. Click `Stop` to halt streaming.
 7. Click the red `Disconnect` toggle button (same Connect button) when finished.
-8. Use `Data Collection`, `Train Model`, `Load Model`, and `Realtime Prediction` to open the EEG ML workflow windows.
-9. Without hardware, run `code/simulator_main.py`, then select `sim://225.1.1.1:6677` from COM dropdown and connect.
+8. Click `Impedance` before recording if you want to open the electrode-contact check window.
+9. Use `Data Collection`, `Train Model`, `Load Model`, and `Realtime Prediction` to open the EEG ML workflow windows.
+10. Without hardware, run `code/simulator_main.py`, then select `sim://225.1.1.1:6677` from COM dropdown and connect.
 
 Filter notes:
 - Filters are display-only and can be changed while streaming.
@@ -65,7 +67,7 @@ Filter notes:
 - Presets: `Raw`, `OpenBCI Default`, `EEG Lab`, `Delta`, `Theta`, `Alpha`, `Beta`, `Gamma`, `Custom`, plus user-saved presets.
 
 EEG ML notes:
-- Training/inference is EEG-specific.
+- Training/inference is EEG-specific (not EMG feature logic).
 - Collection writes labeled **raw EEG** rows with `label` and `trial_id` into a dataset CSV.
 - Collection uses a guided auto protocol (`prep -> hold(record) -> rest`, repeated).
 - Class labels can optionally include image cues. Images are copied into `code/images/class_label_image/` and saved with collection configs.
@@ -73,6 +75,11 @@ EEG ML notes:
 - Trained artifacts are Random-Forest models (with scaler) saved as `.joblib`.
 - Live prediction uses the loaded model window/stride settings.
 - Robustness metrics shown after training include holdout accuracy/F1 and cross-validation accuracy.
+
+Impedance notes:
+- The impedance window can be opened anytime, but scanning requires a real connected Cyton/Cyton+Daisy board.
+- Normal live EEG streaming is paused while the impedance window is open, then restored when the window closes.
+- The app scans channels one at a time with the Cyton lead-off impedance command and shows an approximate kOhm value plus a quality label.
 
 ## Notes
 

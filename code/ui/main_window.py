@@ -28,6 +28,7 @@ from config import (
 )
 from core.board_service import BoardService
 from core.display_pipeline import ActiveFilterPlan, DisplayPipeline, FilterConfig
+from core.impedance_worker import ImpedanceCheckWorker
 from core.preset_store import PresetStore
 from core.ring_buffer import RingBuffer
 from core.serial_ports import list_serial_ports
@@ -220,6 +221,188 @@ class ConnectPortDialog(QtWidgets.QDialog):
         self.message_label.setStyleSheet(themed_label_style("muted"))
 
 
+class ImpedanceCheckWindow(QtWidgets.QDialog):
+    closed = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        board_service: BoardService,
+        channel_count: int,
+        before_scan=None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.board_service = board_service
+        self.channel_count = int(channel_count)
+        self.before_scan = before_scan
+        self.worker: ImpedanceCheckWorker | None = None
+        self.setWindowTitle("Impedance Check")
+        self.setWindowFlag(QtCore.Qt.Window, True)
+        self.setWindowFlag(QtCore.Qt.WindowCloseButtonHint, True)
+        self.setWindowFlag(QtCore.Qt.WindowContextHelpButtonHint, False)
+        self.setModal(False)
+        self.resize(820, 680)
+        self.setMinimumSize(760, 650)
+        apply_dark_title_bar(self)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 10, 16, 14)
+        layout.setSpacing(8)
+
+        title = QtWidgets.QLabel("Electrode Impedance")
+        title.setStyleSheet("font-size: 20px; font-weight: 700; background: transparent;")
+        title.setFixedHeight(30)
+        subtitle = QtWidgets.QLabel(
+            "Runs the Cyton lead-off impedance check one channel at a time. Normal EEG streaming is paused while this window is open."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet(themed_label_style("muted"))
+        subtitle.setFixedHeight(48)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        self.table = QtWidgets.QTableWidget(self.channel_count, 4)
+        self.table.setHorizontalHeaderLabels(["Channel", "Impedance", "Quality", "Signal"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.table.verticalHeader().setMinimumSectionSize(22)
+        self.table.verticalHeader().setDefaultSectionSize(28)
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        row_height = 28
+        self.table.horizontalHeader().setFixedHeight(38)
+        for row in range(self.channel_count):
+            self.table.setRowHeight(row, row_height)
+            self._set_table_text(row, 0, f"CH{row + 1}", "muted")
+            self._set_table_text(row, 1, "Not tested", "muted")
+            self._set_table_text(row, 2, "-", "muted")
+            self._set_table_text(row, 3, "-", "muted")
+        table_height = (
+            self.table.horizontalHeader().height()
+            + self.table.verticalHeader().length()
+            + (2 * self.table.frameWidth())
+            + 2
+        )
+        self.table.setMinimumHeight(table_height)
+        self.table.setMaximumHeight(table_height)
+        layout.addWidget(self.table, 0)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.setSpacing(8)
+        self.scan_button = QtWidgets.QPushButton("Scan All")
+        self.stop_button = QtWidgets.QPushButton("Stop")
+        self.stop_button.setEnabled(False)
+        self.scan_button.setStyleSheet(themed_button_style("accent"))
+        self.stop_button.setStyleSheet(themed_button_style("danger"))
+        self.status_label = QtWidgets.QLabel("Ready")
+        self.status_label.setStyleSheet(themed_label_style("muted"))
+        controls.addWidget(self.scan_button)
+        controls.addWidget(self.stop_button)
+        controls.addWidget(self.status_label, 1)
+        layout.addLayout(controls)
+
+        self.scan_button.clicked.connect(self.start_scan)
+        self.stop_button.clicked.connect(self.stop_scan)
+
+    def start_scan(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if not self.board_service.connected or not self.board_service.is_impedance_supported():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Impedance Check",
+                "Cyton/Cyton+Daisy board is not connected. Connect the real board before scanning impedance.",
+            )
+            return
+        if self.before_scan is not None and not self.before_scan():
+            return
+        for row in range(self.channel_count):
+            self._set_table_text(row, 1, "Waiting", "muted")
+            self._set_table_text(row, 2, "-", "muted")
+            self._set_table_text(row, 3, "-", "muted")
+        self.worker = ImpedanceCheckWorker(self.board_service, channels=list(range(self.channel_count)))
+        self.worker.channel_started.connect(self._on_channel_started)
+        self.worker.channel_result.connect(self._on_channel_result)
+        self.worker.channel_error.connect(self._on_channel_error)
+        self.worker.status.connect(self._set_status)
+        self.worker.finished_cleanly.connect(self._on_scan_finished)
+        self.worker.failed.connect(self._on_scan_failed)
+        self.scan_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self._set_status("Starting impedance scan...")
+        self.worker.start()
+
+    def stop_scan(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.stop()
+            self._set_status("Stopping after current channel...")
+        self.stop_button.setEnabled(False)
+
+    def _on_channel_started(self, channel_index: int) -> None:
+        self._set_table_text(channel_index, 1, "Testing...", "warning")
+        self._set_table_text(channel_index, 2, "-", "warning")
+        self._set_table_text(channel_index, 3, "-", "warning")
+
+    def _on_channel_result(self, channel_index: int, impedance_kohm: float, quality: str, signal_uv_rms: float) -> None:
+        kind = "success" if quality == "Good" else "warning" if quality == "OK" else "danger"
+        self._set_table_text(channel_index, 1, f"{impedance_kohm:.1f} kOhm", kind)
+        self._set_table_text(channel_index, 2, quality, kind)
+        self._set_table_text(channel_index, 3, f"{signal_uv_rms:.2f} uVrms @ 31.5 Hz", kind)
+
+    def _on_channel_error(self, channel_index: int, message: str) -> None:
+        self._set_table_text(channel_index, 1, "Error", "danger")
+        self._set_table_text(channel_index, 2, "Failed", "danger")
+        self._set_table_text(channel_index, 3, message, "danger")
+
+    def _on_scan_finished(self) -> None:
+        self.scan_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self._set_status("Impedance scan complete. Close this window to resume live streaming.")
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
+
+    def _on_scan_failed(self, message: str) -> None:
+        self.scan_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self._set_status(f"Error: {message}", "danger")
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
+
+    def _set_status(self, message: str, kind: str = "muted") -> None:
+        self.status_label.setText(str(message))
+        self.status_label.setStyleSheet(themed_label_style(kind))
+
+    def _set_table_text(self, row: int, column: int, text: str, kind: str = "muted") -> None:
+        if row < 0 or row >= self.table.rowCount():
+            return
+        item = QtWidgets.QTableWidgetItem(str(text))
+        item.setTextAlignment(QtCore.Qt.AlignCenter)
+        if kind == "danger":
+            item.setForeground(QtGui.QColor(THEME_COLORS["danger"]))
+        elif kind == "warning":
+            item.setForeground(QtGui.QColor(THEME_COLORS["warning"]))
+        elif kind == "success":
+            item.setForeground(QtGui.QColor(THEME_COLORS["success"]))
+        else:
+            item.setForeground(QtGui.QColor(THEME_COLORS["muted"]))
+        self.table.setItem(row, column, item)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(4000)
+        self.closed.emit()
+        event.accept()
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, logger: logging.Logger | None = None) -> None:
         super().__init__()
@@ -256,6 +439,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ui_rate_t0 = time.perf_counter()
         self._data_rate_t0 = time.perf_counter()
         self.plotting_suspended = False
+        self.impedance_window: ImpedanceCheckWindow | None = None
+        self._resume_stream_after_impedance = False
 
         self.setWindowTitle(APP_TITLE)
         self.resize(1500, 920)
@@ -288,6 +473,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filters_toggle_button.setChecked(False)
         self.auto_scale_checkbox = QtWidgets.QCheckBox("Auto Scale")
         self.auto_scale_checkbox.setChecked(True)
+        self.impedance_button = QtWidgets.QPushButton("Impedance")
         self.ml_data_button = QtWidgets.QPushButton("Data Collection")
         self.ml_train_button = QtWidgets.QPushButton("Train Model")
         self.ml_load_button = QtWidgets.QPushButton("Load Model")
@@ -304,6 +490,7 @@ class MainWindow(QtWidgets.QMainWindow):
         control_layout.addWidget(self.filters_toggle_button)
         control_layout.addWidget(self.auto_scale_checkbox)
         control_layout.addStretch(1)
+        control_layout.addWidget(self.impedance_button)
         control_layout.addWidget(self.ml_data_button)
         control_layout.addWidget(self.ml_train_button)
         control_layout.addWidget(self.ml_load_button)
@@ -343,6 +530,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.connect_button.clicked.connect(self.handle_connect_toggle)
         self.start_button.clicked.connect(self.handle_start_stop_toggle)
         self.auto_scale_checkbox.toggled.connect(self.handle_auto_scale_toggled)
+        self.impedance_button.clicked.connect(self._open_impedance_window)
         self.ml_data_button.clicked.connect(self._open_data_collection_window)
         self.ml_train_button.clicked.connect(self._open_train_model_window)
         self.ml_load_button.clicked.connect(self._open_load_model_window)
@@ -356,6 +544,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.connect_button,
             self.start_button,
             self.filters_toggle_button,
+            self.impedance_button,
             self.ml_data_button,
             self.ml_train_button,
             self.ml_load_button,
@@ -365,6 +554,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.connect_button.setMinimumWidth(118)
         self.start_button.setMinimumWidth(92)
         self.filters_toggle_button.setMinimumWidth(88)
+        self.impedance_button.setMinimumWidth(118)
         self.ml_data_button.setMinimumWidth(128)
         self.ml_train_button.setMinimumWidth(112)
         self.ml_load_button.setMinimumWidth(108)
@@ -699,6 +889,81 @@ class MainWindow(QtWidgets.QMainWindow):
     def _open_data_collection_window(self) -> None:
         self._open_ml_window(self.eeg_ml_collect_window)
 
+    def _open_impedance_window(self) -> None:
+        if self.impedance_window is not None and self.impedance_window.isVisible():
+            self._position_window_centered_on_main(self.impedance_window)
+            self.impedance_window.raise_()
+            self.impedance_window.activateWindow()
+            return
+
+        self.impedance_window = ImpedanceCheckWindow(
+            self.board_service,
+            self.channel_count,
+            before_scan=self._prepare_impedance_scan,
+            parent=self,
+        )
+        self.impedance_window.closed.connect(self._handle_impedance_window_closed)
+        self._position_window_centered_on_main(self.impedance_window)
+        self.impedance_window.show()
+        self.impedance_window.raise_()
+        self.impedance_window.activateWindow()
+
+    def _prepare_impedance_scan(self) -> bool:
+        if self._any_ml_recording_active():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Impedance Check",
+                "Finish or cancel the active data-recording session before checking impedance.",
+            )
+            return False
+        self._resume_stream_after_impedance = bool(self.board_service.streaming)
+        if self.board_service.streaming:
+            try:
+                self._stop_worker()
+                self.board_service.stop_stream()
+                self._hide_buffering_dialog()
+                for window in self._ml_windows():
+                    window.set_streaming(False)
+                self._set_button_state(connected=True, streaming=False)
+                self._set_status(f"{STATUS_CONNECTED} | Impedance check")
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.exception("Failed to pause stream for impedance check.")
+                self._show_error(str(exc))
+                return False
+        self._set_impedance_controls_active(True)
+        return True
+
+    def _handle_impedance_window_closed(self) -> None:
+        self._set_impedance_controls_active(False)
+        self.impedance_window = None
+        should_resume = bool(self._resume_stream_after_impedance)
+        self._resume_stream_after_impedance = False
+        if should_resume and self.board_service.connected:
+            self.handle_start()
+        elif self.board_service.connected:
+            self._set_button_state(connected=True, streaming=False)
+            self._set_status(self._connected_status_message())
+
+    def _set_impedance_controls_active(self, active: bool) -> None:
+        self.connect_button.setEnabled(not active)
+        self.start_button.setEnabled((not active) and self.board_service.connected)
+        self.impedance_button.setEnabled(not active)
+        self.ml_data_button.setEnabled(not active)
+        self.ml_train_button.setEnabled(not active)
+        self.ml_load_button.setEnabled(not active)
+        self.ml_realtime_button.setEnabled(not active)
+        self.filters_toggle_button.setEnabled(not active)
+
+    def _any_ml_recording_active(self) -> bool:
+        for window in self._ml_windows():
+            if getattr(window, "prestart_running", False):
+                return True
+            if getattr(window, "protocol_running", False):
+                return True
+            if getattr(window, "recorder", None) is not None:
+                return True
+        return False
+
     def _open_train_model_window(self) -> None:
         self._open_ml_window(self.eeg_ml_train_window)
 
@@ -979,6 +1244,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_button_state(self, connected: bool, streaming: bool) -> None:
         self.connect_button.setEnabled(True)
         self.start_button.setEnabled(connected)
+        if hasattr(self, "impedance_button"):
+            self.impedance_button.setEnabled(True)
         self._update_connect_button_appearance(connected)
         self._update_start_button_appearance(connected=connected, streaming=streaming)
 
@@ -1550,6 +1817,8 @@ class MainWindow(QtWidgets.QMainWindow):
             for window in self._ml_windows():
                 if window.isVisible():
                     self._position_window_centered_on_main(window)
+        if self.impedance_window is not None and self.impedance_window.isVisible():
+            self._position_window_centered_on_main(self.impedance_window)
         if self.buffering_dialog is not None and self.buffering_dialog.isVisible():
             self._position_window_centered_on_main(self.buffering_dialog)
 
@@ -1563,6 +1832,8 @@ class MainWindow(QtWidgets.QMainWindow):
             for window in self._ml_windows():
                 if window.isVisible():
                     self._position_window_centered_on_main(window)
+        if self.impedance_window is not None and self.impedance_window.isVisible():
+            self._position_window_centered_on_main(self.impedance_window)
         if self.buffering_dialog is not None and self.buffering_dialog.isVisible():
             self._position_window_centered_on_main(self.buffering_dialog)
 
@@ -1577,6 +1848,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 for window in self._ml_windows():
                     window.shutdown()
                     window.hide()
+            if self.impedance_window is not None:
+                self.impedance_window.close()
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.exception("Shutdown cleanup failed.")
             self.last_error_message = str(exc)

@@ -180,6 +180,24 @@ class BoardService:
             raise RuntimeError("Board is not connected.")
         return str(self._connection_name)
 
+    def is_impedance_supported(self) -> bool:
+        if not self.connected or self.board_id is None or BoardIds is None:
+            return False
+        return int(self.board_id) in {
+            int(BoardIds.CYTON_BOARD.value),
+            int(BoardIds.CYTON_DAISY_BOARD.value),
+        }
+
+    def config_board(self, command: str) -> str:
+        if not self.connected or self.board is None:
+            raise RuntimeError("Board is not connected.")
+        try:
+            result = self.board.config_board(str(command))
+        except BrainFlowError as exc:
+            self.logger.exception("Board config command failed.")
+            raise RuntimeError(f"Board config command failed: {exc}") from exc
+        return "" if result is None else str(result)
+
     def get_current_data(self, sample_count: int):
         if not self.connected or self.board is None:
             raise RuntimeError("Board is not connected.")
