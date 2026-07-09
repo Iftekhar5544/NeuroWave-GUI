@@ -16,8 +16,10 @@ from config import (
     DEFAULT_REDRAW_INTERVAL_MS,
     DEFAULT_SAMPLE_RATE,
     DEFAULT_WINDOW_SECONDS,
+    DISPLAY_AUTOSCALE_APPLY_THRESHOLD,
     DISPLAY_AUTOSCALE_MARGIN,
     DISPLAY_AUTOSCALE_MIN_UV,
+    DISPLAY_AUTOSCALE_REFRESH_FRAMES,
     DISPLAY_FILTER_PRESET,
     DISPLAY_FIXED_SCALE_UV,
     DISPLAY_USER_PRESETS_FILE,
@@ -74,8 +76,16 @@ class StyledArrowComboBox(QtWidgets.QComboBox):
 
 
 class RoundedGraphicsLayoutWidget(pg.GraphicsLayoutWidget):
+    # Class-level default: pyqtgraph's base __init__ calls resizeEvent() before
+    # our instance attributes are assigned, so this must already exist.
+    _masked_size = None
+
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
         super().resizeEvent(event)
+        size = (self.width(), self.height())
+        if size == self._masked_size:
+            return
+        self._masked_size = size
         path = QtGui.QPainterPath()
         rect = QtCore.QRectF(self.rect())
         path.addRoundedRect(rect, 10, 10)
@@ -263,6 +273,49 @@ class ImpedanceCheckWindow(QtWidgets.QDialog):
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
+        threshold_group = QtWidgets.QGroupBox("Quality Thresholds")
+        threshold_layout = QtWidgets.QHBoxLayout(threshold_group)
+        threshold_layout.setContentsMargins(12, 12, 12, 10)
+        threshold_layout.setSpacing(10)
+        self.good_threshold_spin = QtWidgets.QDoubleSpinBox()
+        self.good_threshold_spin.setRange(1.0, 1000.0)
+        self.good_threshold_spin.setDecimals(1)
+        self.good_threshold_spin.setSingleStep(1.0)
+        self.good_threshold_spin.setValue(25.0)
+        self.good_threshold_spin.setSuffix(" kOhm")
+        self.good_threshold_spin.setMinimumWidth(118)
+        self.ok_threshold_spin = QtWidgets.QDoubleSpinBox()
+        self.ok_threshold_spin.setRange(1.0, 1000.0)
+        self.ok_threshold_spin.setDecimals(1)
+        self.ok_threshold_spin.setSingleStep(1.0)
+        self.ok_threshold_spin.setValue(100.0)
+        self.ok_threshold_spin.setSuffix(" kOhm")
+        self.ok_threshold_spin.setMinimumWidth(118)
+        self.impedance_input_mode_combo = QtWidgets.QComboBox()
+        self.impedance_input_mode_combo.addItem("N input (OpenBCI GUI)", "n")
+        self.impedance_input_mode_combo.addItem("P input", "p")
+        self.impedance_input_mode_combo.addItem("Both inputs", "both")
+        self.impedance_input_mode_combo.setMinimumWidth(178)
+        self.impedance_interval_spin = QtWidgets.QDoubleSpinBox()
+        self.impedance_interval_spin.setRange(1.0, 30.0)
+        self.impedance_interval_spin.setDecimals(1)
+        self.impedance_interval_spin.setSingleStep(0.5)
+        self.impedance_interval_spin.setValue(5.0)
+        self.impedance_interval_spin.setSuffix(" sec")
+        self.impedance_interval_spin.setMinimumWidth(110)
+        threshold_hint = QtWidgets.QLabel("Good <= threshold | OK <= threshold | Poor above OK")
+        threshold_hint.setStyleSheet(themed_label_style("muted"))
+        threshold_layout.addWidget(QtWidgets.QLabel("Input"))
+        threshold_layout.addWidget(self.impedance_input_mode_combo)
+        threshold_layout.addWidget(QtWidgets.QLabel("Interval"))
+        threshold_layout.addWidget(self.impedance_interval_spin)
+        threshold_layout.addWidget(QtWidgets.QLabel("Good max"))
+        threshold_layout.addWidget(self.good_threshold_spin)
+        threshold_layout.addWidget(QtWidgets.QLabel("OK max"))
+        threshold_layout.addWidget(self.ok_threshold_spin)
+        threshold_layout.addWidget(threshold_hint, 1)
+        layout.addWidget(threshold_group, 0)
+
         self.table = QtWidgets.QTableWidget(self.channel_count, 4)
         self.table.setHorizontalHeaderLabels(["Channel", "Impedance", "Quality", "Signal"])
         self.table.verticalHeader().setVisible(False)
@@ -309,6 +362,8 @@ class ImpedanceCheckWindow(QtWidgets.QDialog):
 
         self.scan_button.clicked.connect(self.start_scan)
         self.stop_button.clicked.connect(self.stop_scan)
+        self.good_threshold_spin.valueChanged.connect(self._sync_good_threshold)
+        self.ok_threshold_spin.valueChanged.connect(self._sync_ok_threshold)
 
     def start_scan(self) -> None:
         if self.worker is not None and self.worker.isRunning():
@@ -326,7 +381,17 @@ class ImpedanceCheckWindow(QtWidgets.QDialog):
             self._set_table_text(row, 1, "Waiting", "muted")
             self._set_table_text(row, 2, "-", "muted")
             self._set_table_text(row, 3, "-", "muted")
-        self.worker = ImpedanceCheckWorker(self.board_service, channels=list(range(self.channel_count)))
+        good_threshold = float(self.good_threshold_spin.value())
+        ok_threshold = float(self.ok_threshold_spin.value())
+        sample_seconds = float(self.impedance_interval_spin.value())
+        self.worker = ImpedanceCheckWorker(
+            self.board_service,
+            channels=list(range(self.channel_count)),
+            sample_seconds=sample_seconds,
+            good_threshold_kohm=good_threshold,
+            ok_threshold_kohm=ok_threshold,
+            input_mode=str(self.impedance_input_mode_combo.currentData() or "n"),
+        )
         self.worker.channel_started.connect(self._on_channel_started)
         self.worker.channel_result.connect(self._on_channel_result)
         self.worker.channel_error.connect(self._on_channel_error)
@@ -335,7 +400,11 @@ class ImpedanceCheckWindow(QtWidgets.QDialog):
         self.worker.failed.connect(self._on_scan_failed)
         self.scan_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self._set_status("Starting impedance scan...")
+        self._set_threshold_controls_enabled(False)
+        self._set_status(
+            f"Starting impedance scan... Interval {sample_seconds:.1f}s | "
+            f"Good <= {good_threshold:.1f} kOhm | OK <= {ok_threshold:.1f} kOhm"
+        )
         self.worker.start()
 
     def stop_scan(self) -> None:
@@ -363,6 +432,7 @@ class ImpedanceCheckWindow(QtWidgets.QDialog):
     def _on_scan_finished(self) -> None:
         self.scan_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self._set_threshold_controls_enabled(True)
         self._set_status("Impedance scan complete. Close this window to resume live streaming.")
         if self.worker is not None:
             self.worker.deleteLater()
@@ -371,6 +441,7 @@ class ImpedanceCheckWindow(QtWidgets.QDialog):
     def _on_scan_failed(self, message: str) -> None:
         self.scan_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self._set_threshold_controls_enabled(True)
         self._set_status(f"Error: {message}", "danger")
         if self.worker is not None:
             self.worker.deleteLater()
@@ -379,6 +450,20 @@ class ImpedanceCheckWindow(QtWidgets.QDialog):
     def _set_status(self, message: str, kind: str = "muted") -> None:
         self.status_label.setText(str(message))
         self.status_label.setStyleSheet(themed_label_style(kind))
+
+    def _set_threshold_controls_enabled(self, enabled: bool) -> None:
+        self.good_threshold_spin.setEnabled(bool(enabled))
+        self.ok_threshold_spin.setEnabled(bool(enabled))
+        self.impedance_input_mode_combo.setEnabled(bool(enabled))
+        self.impedance_interval_spin.setEnabled(bool(enabled))
+
+    def _sync_good_threshold(self, value: float) -> None:
+        if float(value) > float(self.ok_threshold_spin.value()):
+            self.ok_threshold_spin.setValue(float(value))
+
+    def _sync_ok_threshold(self, value: float) -> None:
+        if float(value) < float(self.good_threshold_spin.value()):
+            self.good_threshold_spin.setValue(float(value))
 
     def _set_table_text(self, row: int, column: int, text: str, kind: str = "muted") -> None:
         if row < 0 or row >= self.table.rowCount():
@@ -422,6 +507,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.x_axis = np.linspace(-self.window_seconds, 0.0, self.sample_rate * self.window_seconds, dtype=np.float64)
         self.latest_display_window = np.full((self.channel_count, self.ring_buffer.capacity), np.nan, dtype=np.float64)
         self.latest_scales = self.display_pipeline.get_fixed_scales()
+        # Tracks the Y-range currently applied to each channel plot so redraw can
+        # skip range updates that would not visibly change. -1 forces a first apply.
+        self._applied_scales = np.full(self.channel_count, -1.0, dtype=np.float64)
+        self._autoscale_frame_counter = 0
         self.display_dirty = False
         self.last_error_message = None
         self.buffering_dialog = None
@@ -439,6 +528,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ui_rate_t0 = time.perf_counter()
         self._data_rate_t0 = time.perf_counter()
         self.plotting_suspended = False
+        self._updating_graph_stream_checkbox = False
         self.impedance_window: ImpedanceCheckWindow | None = None
         self._resume_stream_after_impedance = False
 
@@ -473,6 +563,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filters_toggle_button.setChecked(False)
         self.auto_scale_checkbox = QtWidgets.QCheckBox("Auto Scale")
         self.auto_scale_checkbox.setChecked(True)
+        self.graph_stream_checkbox = QtWidgets.QCheckBox("Graph Stream")
+        self.graph_stream_checkbox.setChecked(True)
         self.impedance_button = QtWidgets.QPushButton("Impedance")
         self.ml_data_button = QtWidgets.QPushButton("Data Collection")
         self.ml_train_button = QtWidgets.QPushButton("Train Model")
@@ -489,6 +581,7 @@ class MainWindow(QtWidgets.QMainWindow):
         control_layout.addWidget(self.start_button)
         control_layout.addWidget(self.filters_toggle_button)
         control_layout.addWidget(self.auto_scale_checkbox)
+        control_layout.addWidget(self.graph_stream_checkbox)
         control_layout.addStretch(1)
         control_layout.addWidget(self.impedance_button)
         control_layout.addWidget(self.ml_data_button)
@@ -530,6 +623,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.connect_button.clicked.connect(self.handle_connect_toggle)
         self.start_button.clicked.connect(self.handle_start_stop_toggle)
         self.auto_scale_checkbox.toggled.connect(self.handle_auto_scale_toggled)
+        self.graph_stream_checkbox.toggled.connect(self.handle_graph_stream_toggled)
         self.impedance_button.clicked.connect(self._open_impedance_window)
         self.ml_data_button.clicked.connect(self._open_data_collection_window)
         self.ml_train_button.clicked.connect(self._open_train_model_window)
@@ -561,10 +655,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ml_realtime_button.setMinimumWidth(152)
         self.status_label.setStyleSheet("font-size: 16px; font-weight: 700; background: transparent;")
         self.metrics_label.setStyleSheet(themed_label_style("muted"))
-        self.auto_scale_checkbox.setStyleSheet(
+        checkbox_style = (
             f"QCheckBox {{ font-weight: 700; color: {THEME_COLORS['text']}; background: transparent; }}"
             f"QCheckBox::indicator {{ width: 16px; height: 16px; }}"
         )
+        self.auto_scale_checkbox.setStyleSheet(checkbox_style)
+        self.graph_stream_checkbox.setStyleSheet(checkbox_style)
 
     def _build_connect_dialog(self) -> None:
         self.connect_dialog = ConnectPortDialog(self)
@@ -868,17 +964,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self._position_window_centered_on_main(self.filter_window)
 
     def _build_ml_window(self) -> None:
-        self.eeg_ml_collect_window = EegMLWindow(logger=self.logger, parent=self, mode="data_collection")
-        self.eeg_ml_train_window = EegMLWindow(logger=self.logger, parent=self, mode="train_model")
-        self.eeg_ml_load_window = EegMLWindow(logger=self.logger, parent=self, mode="load_model")
-        for window in self._ml_windows():
-            window.hide()
-            window.set_stream_context(self.sample_rate, self.channel_count, self.board_service.connected)
-            window.set_streaming(self.board_service.streaming)
-            window.recording_activity_changed.connect(self._set_plotting_suspended)
+        # The EEG ML pipeline windows are heavyweight (each builds a full multi-page
+        # UI plus a background inference thread). Build each one lazily the first
+        # time it is opened instead of constructing all four at startup.
+        self._ml_windows_by_mode: dict[str, EegMLWindow] = {}
+
+    def _get_ml_window(self, mode: str) -> EegMLWindow:
+        window = self._ml_windows_by_mode.get(mode)
+        if window is not None:
+            return window
+        window = EegMLWindow(logger=self.logger, parent=self, mode=mode)
+        window.hide()
+        window.set_stream_context(self.sample_rate, self.channel_count, self.board_service.connected)
+        window.set_streaming(self.board_service.streaming)
+        window.recording_activity_changed.connect(self._handle_recording_activity_changed)
+        window.prediction_activity_changed.connect(self._handle_prediction_activity_changed)
+        if mode in ("train_model", "load_model"):
+            window.model_loaded.connect(self._handle_ml_model_loaded)
+        self._ml_windows_by_mode[mode] = window
+        return window
 
     def _ml_windows(self) -> list[EegMLWindow]:
-        return [self.eeg_ml_collect_window, self.eeg_ml_train_window, self.eeg_ml_load_window]
+        # Only windows that have actually been created so far.
+        return list(self._ml_windows_by_mode.values())
+
+    def _handle_ml_model_loaded(self, source_window: EegMLWindow) -> None:
+        realtime = self._ml_windows_by_mode.get("realtime_prediction")
+        if realtime is None or source_window is realtime:
+            return
+        realtime.adopt_model_from(source_window)
 
     def _open_ml_window(self, window: EegMLWindow) -> None:
         self._position_window_centered_on_main(window)
@@ -887,7 +1001,7 @@ class MainWindow(QtWidgets.QMainWindow):
         window.activateWindow()
 
     def _open_data_collection_window(self) -> None:
-        self._open_ml_window(self.eeg_ml_collect_window)
+        self._open_ml_window(self._get_ml_window("data_collection"))
 
     def _open_impedance_window(self) -> None:
         if self.impedance_window is not None and self.impedance_window.isVisible():
@@ -939,8 +1053,10 @@ class MainWindow(QtWidgets.QMainWindow):
         should_resume = bool(self._resume_stream_after_impedance)
         self._resume_stream_after_impedance = False
         if should_resume and self.board_service.connected:
+            self._reset_buffer()
             self.handle_start()
         elif self.board_service.connected:
+            self._reset_buffer()
             self._set_button_state(connected=True, streaming=False)
             self._set_status(self._connected_status_message())
 
@@ -965,13 +1081,20 @@ class MainWindow(QtWidgets.QMainWindow):
         return False
 
     def _open_train_model_window(self) -> None:
-        self._open_ml_window(self.eeg_ml_train_window)
+        self._open_ml_window(self._get_ml_window("train_model"))
 
     def _open_load_model_window(self) -> None:
-        self._open_ml_window(self.eeg_ml_load_window)
+        self._open_ml_window(self._get_ml_window("load_model"))
 
     def _open_realtime_prediction_window(self) -> None:
-        self._open_ml_window(self.eeg_ml_load_window)
+        realtime = self._get_ml_window("realtime_prediction")
+        load_window = self._ml_windows_by_mode.get("load_model")
+        train_window = self._ml_windows_by_mode.get("train_model")
+        if load_window is not None and load_window.model_bundle is not None:
+            realtime.adopt_model_from(load_window)
+        elif train_window is not None and train_window.model_bundle is not None:
+            realtime.adopt_model_from(train_window)
+        self._open_ml_window(realtime)
 
     def _center_main_window(self) -> None:
         screen = QtWidgets.QApplication.primaryScreen()
@@ -1069,7 +1192,9 @@ class MainWindow(QtWidgets.QMainWindow):
             plot.hideAxis("bottom")
             plot.addItem(pg.InfiniteLine(pos=0.0, angle=0, movable=False, pen=pg.mkPen(THEME_COLORS["graph_zero"], width=1)))
 
-            curve = plot.plot(pen=pg.mkPen(channel_color, width=2))
+            curve = plot.plot(pen=pg.mkPen(channel_color, width=1))
+            curve.setClipToView(True)
+            curve.setDownsampling(auto=True, method="peak")
             self.channel_plots.append(plot)
             self.curves.append(curve)
 
@@ -1310,6 +1435,21 @@ class MainWindow(QtWidgets.QMainWindow):
         for window in self._ml_windows():
             window.set_stream_context(self.sample_rate, self.channel_count, connected=True)
             window.set_streaming(False)
+        if connection_name.startswith("CSV Replay"):
+            self._apply_csv_replay_display_defaults()
+
+    def _apply_csv_replay_display_defaults(self) -> None:
+        current_preset = (self.active_filter_plan.config.preset_name or "").strip() if self.active_filter_plan else ""
+        if current_preset not in {"", "Raw"}:
+            return
+        replay_preset = self.preset_store.get("OpenBCI GUI")
+        if replay_preset is None:
+            return
+        self.auto_scale_checkbox.setChecked(True)
+        self._select_preset_name("OpenBCI GUI")
+        self._fill_filter_controls_from_config(replay_preset)
+        self.handle_apply_filters()
+        self._set_status(f"{self._connected_status_message()} | OpenBCI GUI display preset + auto scale applied")
 
     def handle_connect(self) -> None:
         self._open_connect_dialog()
@@ -1321,6 +1461,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.x_axis = np.linspace(-self.window_seconds, 0.0, capacity, dtype=np.float64)
         self.latest_display_window = np.full((self.channel_count, capacity), np.nan, dtype=np.float64)
         self.latest_scales = self.display_pipeline.get_fixed_scales()
+        self._applied_scales = np.full(self.channel_count, -1.0, dtype=np.float64)
+        self._autoscale_frame_counter = 0
         self.display_dirty = False
         self._update_channel_selector_items()
         self._rebuild_curves()
@@ -1366,6 +1508,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def handle_start(self) -> None:
         try:
             self._reset_runtime_metrics()
+            self._hide_buffering_dialog()
+            self.display_pipeline.reset(self.sample_rate, self.channel_count)
+            self.display_pipeline.set_active_plan(self.active_filter_plan)
+            self.ring_buffer.clear()
+            self.display_buffer.clear()
+            self.display_dirty = False
+            self.latest_display_window = np.full((self.channel_count, self.ring_buffer.capacity), np.nan, dtype=np.float64)
+            self.latest_scales = self.display_pipeline.get_fixed_scales()
+            self._applied_scales = np.full(self.channel_count, -1.0, dtype=np.float64)
+            self._autoscale_frame_counter = 0
             self.board_service.start_stream()
             self.stream_worker = self._create_worker()
             self.stream_worker.start()
@@ -1449,9 +1601,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.ring_buffer.append(chunk)
                 processed_chunk = self.display_pipeline.process_chunk(chunk)
                 self.display_buffer.append(processed_chunk)
-                if self.auto_scale_checkbox.isChecked():
-                    self.latest_scales = self.display_pipeline.update_auto_scales_from_chunk(processed_chunk)
-                else:
+                # Auto-scale ranges are recomputed from the visible window on the
+                # (throttled) redraw path, so no per-chunk scale work is needed here.
+                if not self.auto_scale_checkbox.isChecked():
                     self.latest_scales = self.display_pipeline.get_fixed_scales()
                 self.display_dirty = True
         except Exception as exc:  # pylint: disable=broad-except
@@ -1495,15 +1647,50 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.board_service.streaming and "Buffering" in self.status_label.text():
             self._set_status(STATUS_STREAMING)
 
+        window_updated = self.display_dirty
         if self.display_dirty:
             self.latest_display_window = self.display_buffer.get_window()
             self.display_dirty = False
 
-        for index, curve in enumerate(self.curves):
-            curve.setData(self.x_axis, self.latest_display_window[index])
-            if self.auto_scale_checkbox.isChecked():
-                scale = max(DISPLAY_AUTOSCALE_MIN_UV, float(self.latest_scales[index]))
-                self.channel_plots[index].setYRange(-scale, scale, padding=0)
+        # Refresh the traces only when there is a new display window to draw.
+        if window_updated:
+            for index, curve in enumerate(self.curves):
+                curve.setData(self.x_axis, self.latest_display_window[index])
+
+        # Recompute auto-scale ranges on a throttled cadence rather than every
+        # frame, and only push a new Y-range when it changes meaningfully.
+        if self.auto_scale_checkbox.isChecked():
+            self._autoscale_frame_counter += 1
+            if self._autoscale_frame_counter >= DISPLAY_AUTOSCALE_REFRESH_FRAMES:
+                self._autoscale_frame_counter = 0
+                self.latest_scales = self._compute_visible_auto_scales()
+                self._apply_auto_scales(self.latest_scales)
+
+    def _apply_auto_scales(self, scales: np.ndarray) -> None:
+        for index, plot in enumerate(self.channel_plots):
+            scale = max(DISPLAY_AUTOSCALE_MIN_UV, float(scales[index]))
+            previous = float(self._applied_scales[index])
+            reference = max(previous, DISPLAY_AUTOSCALE_MIN_UV)
+            if previous < 0.0 or abs(scale - previous) > DISPLAY_AUTOSCALE_APPLY_THRESHOLD * reference:
+                plot.setYRange(-scale, scale, padding=0)
+                self._applied_scales[index] = scale
+
+    def _compute_visible_auto_scales(self) -> np.ndarray:
+        if self.latest_display_window.shape[0] != self.channel_count:
+            return self.display_pipeline.get_fixed_scales()
+        if not np.isfinite(self.latest_display_window).any():
+            return self.display_pipeline.get_fixed_scales()
+
+        abs_window = np.abs(self.latest_display_window.astype(np.float64, copy=False))
+        scales = np.full(self.channel_count, DISPLAY_AUTOSCALE_MIN_UV, dtype=np.float64)
+        for channel_index in range(self.channel_count):
+            values = abs_window[channel_index]
+            values = values[np.isfinite(values)]
+            if values.size == 0:
+                continue
+            robust_peak = float(np.percentile(values, 98.5))
+            scales[channel_index] = max(DISPLAY_AUTOSCALE_MIN_UV, robust_peak * DISPLAY_AUTOSCALE_MARGIN)
+        return scales
 
     def _set_plotting_suspended(self, suspended: bool) -> None:
         suspended = bool(suspended)
@@ -1525,20 +1712,49 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.board_service.streaming:
                 self._set_status(STATUS_STREAMING)
 
+    def _set_graph_stream_checked(self, checked: bool) -> None:
+        self._updating_graph_stream_checkbox = True
+        self.graph_stream_checkbox.setChecked(bool(checked))
+        self._updating_graph_stream_checkbox = False
+
+    def handle_graph_stream_toggled(self, enabled: bool) -> None:
+        if self._updating_graph_stream_checkbox:
+            return
+        self._set_plotting_suspended(not bool(enabled))
+        state_text = "ON" if enabled else "OFF"
+        self._set_status(f"{self._current_base_status()} | Graph Stream {state_text}")
+
+    def _turn_graph_stream_off_for_workflow(self, workflow_name: str) -> None:
+        if not self.graph_stream_checkbox.isChecked() and self.plotting_suspended:
+            return
+        self._set_graph_stream_checked(False)
+        self._set_plotting_suspended(True)
+        self._set_status(f"{self._current_base_status()} | Graph Stream OFF for {workflow_name}")
+
+    def _handle_recording_activity_changed(self, active: bool) -> None:
+        if active:
+            self._turn_graph_stream_off_for_workflow("data collection")
+
+    def _handle_prediction_activity_changed(self, active: bool) -> None:
+        if active:
+            self._turn_graph_stream_off_for_workflow("realtime prediction")
+
     def handle_auto_scale_toggled(self, enabled: bool) -> None:
         if not enabled:
             for plot in self.channel_plots:
                 plot.disableAutoRange(axis="y")
                 plot.setYRange(-DISPLAY_FIXED_SCALE_UV, DISPLAY_FIXED_SCALE_UV, padding=0)
             self.latest_scales = self.display_pipeline.get_fixed_scales()
+            self._applied_scales[:] = -1.0
             self._set_status(f"{self._current_base_status()} | Auto Scale OFF")
             return
 
         for plot in self.channel_plots:
             plot.disableAutoRange(axis="y")
-        if np.isfinite(self.latest_display_window).any():
-            peaks = np.nanmax(np.abs(self.latest_display_window), axis=1)
-            self.latest_scales = np.maximum(DISPLAY_AUTOSCALE_MIN_UV, peaks * DISPLAY_AUTOSCALE_MARGIN)
+        self.latest_scales = self._compute_visible_auto_scales()
+        self._applied_scales[:] = -1.0
+        self._autoscale_frame_counter = 0
+        self._apply_auto_scales(self.latest_scales)
         self.display_dirty = True
         self._set_status(self._current_base_status())
 
@@ -1813,7 +2029,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._position_filter_window()
         if hasattr(self, "connect_dialog") and self.connect_dialog.isVisible():
             self._position_window_centered_on_main(self.connect_dialog)
-        if hasattr(self, "eeg_ml_collect_window"):
+        if hasattr(self, "_ml_windows_by_mode"):
             for window in self._ml_windows():
                 if window.isVisible():
                     self._position_window_centered_on_main(window)
@@ -1828,7 +2044,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._position_filter_window()
         if hasattr(self, "connect_dialog") and self.connect_dialog.isVisible():
             self._position_window_centered_on_main(self.connect_dialog)
-        if hasattr(self, "eeg_ml_collect_window"):
+        if hasattr(self, "_ml_windows_by_mode"):
             for window in self._ml_windows():
                 if window.isVisible():
                     self._position_window_centered_on_main(window)
@@ -1844,7 +2060,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._hide_buffering_dialog()
             if hasattr(self, "filter_window"):
                 self.filter_window.close()
-            if hasattr(self, "eeg_ml_collect_window"):
+            if hasattr(self, "_ml_windows_by_mode"):
                 for window in self._ml_windows():
                     window.shutdown()
                     window.hide()

@@ -8,6 +8,7 @@ from core.display_pipeline import FilterConfig
 
 BUILTIN_PRESET_ORDER = [
     "Raw",
+    "OpenBCI GUI",
     "OpenBCI Default",
     "EEG Lab",
     "Delta",
@@ -35,6 +36,19 @@ class PresetStore:
             lowpass_enabled=False,
             notch_enabled=False,
             bandpass_enabled=False,
+        )
+        presets["OpenBCI GUI"] = FilterConfig(
+            enabled=True,
+            preset_name="OpenBCI GUI",
+            highpass_enabled=False,
+            lowpass_enabled=False,
+            notch_enabled=True,
+            notch_freq=50,
+            notch_q=30.0,
+            bandpass_enabled=True,
+            bandpass_low_hz=5.0,
+            bandpass_high_hz=50.0,
+            bandpass_order=4,
         )
         presets["OpenBCI Default"] = FilterConfig(
             enabled=True,

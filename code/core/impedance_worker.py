@@ -25,14 +25,20 @@ class ImpedanceCheckWorker(QtCore.QThread):
         self,
         board_service,
         channels: list[int] | None = None,
-        sample_seconds: float = 2.0,
+        sample_seconds: float = 5.0,
         settle_seconds: float = 0.45,
+        good_threshold_kohm: float = 25.0,
+        ok_threshold_kohm: float = 100.0,
+        input_mode: str = "n",
     ) -> None:
         super().__init__()
         self.board_service = board_service
         self.channels = list(channels or [])
         self.sample_seconds = float(sample_seconds)
         self.settle_seconds = float(settle_seconds)
+        self.good_threshold_kohm = float(good_threshold_kohm)
+        self.ok_threshold_kohm = float(ok_threshold_kohm)
+        self.input_mode = str(input_mode or "n").strip().lower()
         self._running = False
 
     def stop(self) -> None:
@@ -61,12 +67,13 @@ class ImpedanceCheckWorker(QtCore.QThread):
                     continue
 
                 token = CYTON_DAISY_IMPEDANCE_TOKENS[channel_index]
+                p_flag, n_flag = self._input_mode_flags()
                 active_token = token
                 self.channel_started.emit(channel_index)
                 self.status.emit(f"Testing CH{channel_index + 1}...")
 
                 try:
-                    self.board_service.config_board(f"z{token}11Z")
+                    self.board_service.config_board(f"z{token}{p_flag}{n_flag}Z")
                     time.sleep(max(0.0, self.settle_seconds))
                     self.board_service.start_stream()
                     stream_started = True
@@ -81,7 +88,11 @@ class ImpedanceCheckWorker(QtCore.QThread):
                     eeg_row = int(eeg_channels[channel_index])
                     values = np.asarray(board_data[eeg_row, :], dtype=np.float64)
                     impedance_kohm, signal_uv_rms = estimate_impedance_kohm(values, sample_rate)
-                    quality = impedance_quality_label(impedance_kohm)
+                    quality = impedance_quality_label(
+                        impedance_kohm,
+                        good_threshold_kohm=self.good_threshold_kohm,
+                        ok_threshold_kohm=self.ok_threshold_kohm,
+                    )
                     self.channel_result.emit(channel_index, impedance_kohm, quality, signal_uv_rms)
                 except Exception as exc:  # pylint: disable=broad-except
                     if stream_started:
@@ -122,6 +133,17 @@ class ImpedanceCheckWorker(QtCore.QThread):
                 self.board_service.config_board(f"z{token}00Z")
             except Exception:
                 pass
+        try:
+            self.board_service.restore_all_channels_on()
+        except Exception:
+            pass
+
+    def _input_mode_flags(self) -> tuple[str, str]:
+        if self.input_mode == "p":
+            return "1", "0"
+        if self.input_mode == "both":
+            return "1", "1"
+        return "0", "1"
 
 
 def estimate_impedance_kohm(samples_uv: np.ndarray, sample_rate: int) -> tuple[float, float]:
@@ -144,10 +166,16 @@ def estimate_impedance_kohm(samples_uv: np.ndarray, sample_rate: int) -> tuple[f
     return impedance_kohm, signal_uv_rms
 
 
-def impedance_quality_label(impedance_kohm: float) -> str:
+def impedance_quality_label(
+    impedance_kohm: float,
+    good_threshold_kohm: float = 25.0,
+    ok_threshold_kohm: float = 100.0,
+) -> str:
     value = float(impedance_kohm)
-    if value <= 25.0:
+    good_limit = float(good_threshold_kohm)
+    ok_limit = max(good_limit, float(ok_threshold_kohm))
+    if value <= good_limit:
         return "Good"
-    if value <= 100.0:
+    if value <= ok_limit:
         return "OK"
     return "Poor"

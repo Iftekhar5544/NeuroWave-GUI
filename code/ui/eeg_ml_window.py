@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from app_theme import THEME_COLORS, apply_dark_title_bar, themed_button_style, themed_label_style
@@ -463,6 +464,8 @@ class RecordingSessionWindow(QtWidgets.QDialog):
 class EegMLWindow(QtWidgets.QDialog):
     closed = QtCore.pyqtSignal()
     recording_activity_changed = QtCore.pyqtSignal(bool)
+    model_loaded = QtCore.pyqtSignal(object)
+    prediction_activity_changed = QtCore.pyqtSignal(bool)
 
     def __init__(
         self,
@@ -479,14 +482,19 @@ class EegMLWindow(QtWidgets.QDialog):
         self.streaming = False
         self.recorder: LabeledEegRecorder | None = None
         self.model_bundle = None
+        self.loaded_model_path = ""
         self.prediction_enabled = False
         self.train_worker: TrainModelWorker | None = None
         self.inference_worker = EEGInferenceWorker()
         self.inference_worker.prediction_ready.connect(self._on_prediction_ready)
         self.inference_worker.error.connect(self._on_prediction_error)
-        self.inference_worker.start()
+        # The inference thread is started lazily when live prediction actually
+        # begins, so idle/unused windows don't keep a background thread spinning.
         self.infer_ring = RingBuffer(self.channel_count, self.sample_rate * 10)
         self._samples_since_submit = 0
+        self._prediction_bar_item = None
+        self._last_prediction_ts = 0.0
+        self._prediction_rate_hz = 0.0
         self.protocol_running = False
         self.protocol_labels: list[str] = []
         self.protocol_repeat_total = 0
@@ -681,104 +689,156 @@ class EegMLWindow(QtWidgets.QDialog):
         self.agree_no.stateChanged.connect(self._on_agree_no_changed)
         self.top_grid.addWidget(self.collect_group, 0, 0)
 
-        self.train_group = QtWidgets.QGroupBox("2) Train Model")
+        self.train_group = QtWidgets.QGroupBox("Train Model")
         train_form = QtWidgets.QFormLayout(self.train_group)
         train_form.setLabelAlignment(QtCore.Qt.AlignLeft)
         train_form.setHorizontalSpacing(10)
         train_form.setVerticalSpacing(8)
 
         self.train_input_edit = QtWidgets.QLineEdit(str(default_dataset_root))
+        self.train_input_edit.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         browse_train_in = QtWidgets.QPushButton("CSV")
         browse_train_in.clicked.connect(self._browse_train_input_file)
         browse_train_folder = QtWidgets.QPushButton("Folder")
         browse_train_folder.clicked.connect(self._browse_train_input_folder)
         train_in_row = QtWidgets.QHBoxLayout()
+        train_in_row.setContentsMargins(0, 0, 0, 0)
+        train_in_row.setSpacing(8)
         train_in_row.addWidget(self.train_input_edit, 1)
         train_in_row.addWidget(browse_train_in)
         train_in_row.addWidget(browse_train_folder)
         train_in_box = QtWidgets.QWidget()
+        train_in_box.setAttribute(QtCore.Qt.WA_StyledBackground, False)
+        train_in_box.setObjectName("trainInputRow")
+        train_in_box.setStyleSheet("QWidget#trainInputRow { background: transparent; border: none; }")
         train_in_box.setLayout(train_in_row)
         train_form.addRow("Dataset Input", train_in_box)
 
         default_model_root = PROJECT_ROOT / DEFAULT_ML_MODEL_DIR
         self.model_output_root_edit = QtWidgets.QLineEdit(str(default_model_root))
+        self.model_output_root_edit.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         browse_model_out = QtWidgets.QPushButton("Browse")
         browse_model_out.clicked.connect(self._browse_model_output_root)
         model_out_row = QtWidgets.QHBoxLayout()
+        model_out_row.setContentsMargins(0, 0, 0, 0)
+        model_out_row.setSpacing(8)
         model_out_row.addWidget(self.model_output_root_edit, 1)
         model_out_row.addWidget(browse_model_out)
         model_out_box = QtWidgets.QWidget()
+        model_out_box.setAttribute(QtCore.Qt.WA_StyledBackground, False)
+        model_out_box.setObjectName("modelOutputRow")
+        model_out_box.setStyleSheet("QWidget#modelOutputRow { background: transparent; border: none; }")
         model_out_box.setLayout(model_out_row)
         train_form.addRow("Model Root", model_out_box)
 
         self.run_name_edit = QtWidgets.QLineEdit(DEFAULT_ML_RUN_NAME)
+        self.run_name_edit.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         train_form.addRow("Run Name", self.run_name_edit)
 
         self.model_file_edit = QtWidgets.QLineEdit(DEFAULT_ML_MODEL_ARTIFACT)
+        self.model_file_edit.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         train_form.addRow("Model File", self.model_file_edit)
 
         self.window_ms_spin = QtWidgets.QSpinBox()
+        self.window_ms_spin.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.window_ms_spin.setRange(500, 5000)
         self.window_ms_spin.setSingleStep(100)
         self.window_ms_spin.setValue(2000)
-        train_form.addRow("Window (ms)", self.window_ms_spin)
 
         self.stride_ms_spin = QtWidgets.QSpinBox()
+        self.stride_ms_spin.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.stride_ms_spin.setRange(100, 2000)
         self.stride_ms_spin.setSingleStep(50)
         self.stride_ms_spin.setValue(500)
 
         window_stride_row = QtWidgets.QWidget()
+        window_stride_row.setAttribute(QtCore.Qt.WA_StyledBackground, False)
+        window_stride_row.setObjectName("windowStrideRow")
+        window_stride_row.setStyleSheet("QWidget#windowStrideRow { background: transparent; border: none; }")
         window_stride_layout = QtWidgets.QHBoxLayout(window_stride_row)
         window_stride_layout.setContentsMargins(0, 0, 0, 0)
-        window_stride_layout.setSpacing(6)
+        window_stride_layout.setSpacing(2)
         window_stride_layout.addWidget(QtWidgets.QLabel("Window"))
         window_stride_layout.addWidget(self.window_ms_spin)
+        window_stride_layout.addSpacing(64)
         window_stride_layout.addWidget(QtWidgets.QLabel("Stride"))
         window_stride_layout.addWidget(self.stride_ms_spin)
         train_form.addRow("Window/Stride (ms)", window_stride_row)
 
         self.trees_spin = QtWidgets.QSpinBox()
+        self.trees_spin.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.trees_spin.setRange(100, 3000)
         self.trees_spin.setValue(800)
 
         self.depth_spin = QtWidgets.QSpinBox()
+        self.depth_spin.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.depth_spin.setRange(0, 100)
         self.depth_spin.setValue(0)
         self.depth_spin.setToolTip("0 means no max depth.")
 
         rf_row = QtWidgets.QWidget()
+        rf_row.setAttribute(QtCore.Qt.WA_StyledBackground, False)
+        rf_row.setObjectName("rfParamsRow")
+        rf_row.setStyleSheet("QWidget#rfParamsRow { background: transparent; border: none; }")
         rf_layout = QtWidgets.QHBoxLayout(rf_row)
         rf_layout.setContentsMargins(0, 0, 0, 0)
-        rf_layout.setSpacing(6)
+        rf_layout.setSpacing(2)
         rf_layout.addWidget(QtWidgets.QLabel("Trees"))
         rf_layout.addWidget(self.trees_spin)
+        rf_layout.addSpacing(64)
         rf_layout.addWidget(QtWidgets.QLabel("Max Depth"))
         rf_layout.addWidget(self.depth_spin)
         train_form.addRow("RF Params", rf_row)
 
         self.test_split_spin = QtWidgets.QDoubleSpinBox()
+        self.test_split_spin.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.test_split_spin.setRange(0.1, 0.4)
         self.test_split_spin.setSingleStep(0.05)
         self.test_split_spin.setValue(0.2)
 
         self.seed_spin = QtWidgets.QSpinBox()
+        self.seed_spin.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.seed_spin.setRange(0, 99999)
         self.seed_spin.setValue(42)
 
         eval_row = QtWidgets.QWidget()
+        eval_row.setAttribute(QtCore.Qt.WA_StyledBackground, False)
+        eval_row.setObjectName("evalParamsRow")
+        eval_row.setStyleSheet("QWidget#evalParamsRow { background: transparent; border: none; }")
         eval_layout = QtWidgets.QHBoxLayout(eval_row)
         eval_layout.setContentsMargins(0, 0, 0, 0)
-        eval_layout.setSpacing(6)
+        eval_layout.setSpacing(2)
         eval_layout.addWidget(QtWidgets.QLabel("Test Split"))
         eval_layout.addWidget(self.test_split_spin)
+        eval_layout.addSpacing(64)
         eval_layout.addWidget(QtWidgets.QLabel("Seed"))
         eval_layout.addWidget(self.seed_spin)
         train_form.addRow("Eval Params", eval_row)
 
+        for field in [
+            train_in_box,
+            model_out_box,
+            self.run_name_edit,
+            self.model_file_edit,
+            window_stride_row,
+            rf_row,
+            eval_row,
+        ]:
+            label = train_form.labelForField(field)
+            if isinstance(label, QtWidgets.QLabel):
+                label.setStyleSheet("font-weight: 700; background: transparent;")
+
         self.train_button = QtWidgets.QPushButton("Train EEG Model")
         self.train_button.clicked.connect(self._on_train_clicked)
-        train_form.addRow("Train", self.train_button)
+        train_button_row = QtWidgets.QWidget()
+        train_button_row.setObjectName("trainButtonRow")
+        train_button_row.setStyleSheet("QWidget#trainButtonRow { background: transparent; border: none; }")
+        train_button_layout = QtWidgets.QHBoxLayout(train_button_row)
+        train_button_layout.setContentsMargins(0, 12, 0, 0)
+        train_button_layout.addStretch(1)
+        train_button_layout.addWidget(self.train_button)
+        train_button_layout.addStretch(1)
+        train_form.addRow(train_button_row)
         self.top_grid.addWidget(self.train_group, 0, 1)
 
         root_layout.addWidget(self.top_panel, 2)
@@ -795,10 +855,15 @@ class EegMLWindow(QtWidgets.QDialog):
         load_run_button = QtWidgets.QPushButton("Load Run")
         load_run_button.clicked.connect(self._on_load_run_folder_clicked)
         run_row = QtWidgets.QHBoxLayout()
+        run_row.setContentsMargins(0, 0, 0, 0)
+        run_row.setSpacing(8)
         run_row.addWidget(self.run_folder_edit, 1)
         run_row.addWidget(browse_run_folder)
         run_row.addWidget(load_run_button)
         run_box = QtWidgets.QWidget()
+        run_box.setAttribute(QtCore.Qt.WA_StyledBackground, False)
+        run_box.setObjectName("loadRunRow")
+        run_box.setStyleSheet("QWidget#loadRunRow { background: transparent; border: none; }")
         run_box.setLayout(run_row)
         predict_form.addRow("Run Folder", run_box)
 
@@ -808,10 +873,15 @@ class EegMLWindow(QtWidgets.QDialog):
         load_model_button = QtWidgets.QPushButton("Load File")
         load_model_button.clicked.connect(self._on_load_model_clicked)
         model_in_row = QtWidgets.QHBoxLayout()
+        model_in_row.setContentsMargins(0, 0, 0, 0)
+        model_in_row.setSpacing(8)
         model_in_row.addWidget(self.model_path_edit, 1)
         model_in_row.addWidget(browse_model_in)
         model_in_row.addWidget(load_model_button)
         model_in_box = QtWidgets.QWidget()
+        model_in_box.setAttribute(QtCore.Qt.WA_StyledBackground, False)
+        model_in_box.setObjectName("loadModelFileRow")
+        model_in_box.setStyleSheet("QWidget#loadModelFileRow { background: transparent; border: none; }")
         model_in_box.setLayout(model_in_row)
         predict_form.addRow("Model File", model_in_box)
 
@@ -828,6 +898,9 @@ class EegMLWindow(QtWidgets.QDialog):
         self.latency_label = QtWidgets.QLabel("Latency: N/A")
 
         output_row = QtWidgets.QWidget()
+        output_row.setAttribute(QtCore.Qt.WA_StyledBackground, False)
+        output_row.setObjectName("liveOutputRow")
+        output_row.setStyleSheet("QWidget#liveOutputRow { background: transparent; border: none; }")
         output_layout = QtWidgets.QHBoxLayout(output_row)
         output_layout.setContentsMargins(0, 0, 0, 0)
         output_layout.setSpacing(10)
@@ -837,9 +910,65 @@ class EegMLWindow(QtWidgets.QDialog):
         predict_form.addRow("Live Output", output_row)
         root_layout.addWidget(self.load_group, 1)
 
+        self.realtime_group = QtWidgets.QGroupBox("Realtime Prediction")
+        realtime_layout = QtWidgets.QVBoxLayout(self.realtime_group)
+        realtime_layout.setContentsMargins(16, 18, 16, 16)
+        realtime_layout.setSpacing(10)
+
+        self.realtime_model_label = QtWidgets.QLabel("Model: Not loaded")
+        realtime_layout.addWidget(self.realtime_model_label)
+
+        self.realtime_meta_box = QtWidgets.QPlainTextEdit()
+        self.realtime_meta_box.setReadOnly(True)
+        self.realtime_meta_box.setMaximumHeight(112)
+        realtime_layout.addWidget(self.realtime_meta_box)
+
+        self.realtime_pred_label = QtWidgets.QLabel("Prediction: N/A")
+        self.realtime_conf_label = QtWidgets.QLabel("Confidence: 0.0%")
+        self.realtime_latency_label = QtWidgets.QLabel("Latency: N/A")
+        self.realtime_rate_label = QtWidgets.QLabel("Rate: 0.0/sec")
+
+        realtime_stats = QtWidgets.QGridLayout()
+        realtime_stats.setContentsMargins(0, 0, 0, 0)
+        realtime_stats.setHorizontalSpacing(14)
+        realtime_stats.setVerticalSpacing(6)
+        realtime_stats.addWidget(self.realtime_pred_label, 0, 0)
+        realtime_stats.addWidget(self.realtime_conf_label, 0, 1)
+        realtime_stats.addWidget(self.realtime_latency_label, 1, 0)
+        realtime_stats.addWidget(self.realtime_rate_label, 1, 1)
+        realtime_layout.addLayout(realtime_stats)
+
+        self.realtime_predict_toggle = QtWidgets.QPushButton("Start Live Prediction")
+        self.realtime_predict_toggle.setCheckable(True)
+        self.realtime_predict_toggle.toggled.connect(self._on_predict_toggled)
+        realtime_button_row = QtWidgets.QHBoxLayout()
+        realtime_button_row.setContentsMargins(0, 0, 0, 0)
+        realtime_button_row.addStretch(1)
+        realtime_button_row.addWidget(self.realtime_predict_toggle)
+        realtime_button_row.addStretch(1)
+        realtime_layout.addLayout(realtime_button_row)
+
+        self.realtime_bar_plot = pg.PlotWidget()
+        self.realtime_bar_plot.setBackground(THEME_COLORS["bg"])
+        self.realtime_bar_plot.showGrid(x=True, y=True, alpha=0.22)
+        self.realtime_bar_plot.setMouseEnabled(x=False, y=False)
+        self.realtime_bar_plot.setMenuEnabled(False)
+        self.realtime_bar_plot.hideButtons()
+        self.realtime_bar_plot.setYRange(0.0, 100.0, padding=0.02)
+        self.realtime_bar_plot.setLabel("left", "Confidence (%)")
+        self.realtime_bar_plot.setLabel("bottom", "Class")
+        self.realtime_bar_plot.getAxis("left").setPen(pg.mkPen(THEME_COLORS["text"]))
+        self.realtime_bar_plot.getAxis("bottom").setPen(pg.mkPen(THEME_COLORS["text"]))
+        self.realtime_bar_plot.getAxis("left").setTextPen(pg.mkPen(THEME_COLORS["text"]))
+        self.realtime_bar_plot.getAxis("bottom").setTextPen(pg.mkPen(THEME_COLORS["text"]))
+        self.realtime_bar_plot.getViewBox().setMouseEnabled(x=False, y=False)
+        self.realtime_bar_plot.getViewBox().setMenuEnabled(False)
+        realtime_layout.addWidget(self.realtime_bar_plot, 1)
+        root_layout.addWidget(self.realtime_group, 1)
+
         self.metrics_box = QtWidgets.QPlainTextEdit()
         self.metrics_box.setReadOnly(True)
-        self.metrics_box.setMinimumHeight(190)
+        self.metrics_box.setMinimumHeight(130)
         self.log_group = QtWidgets.QGroupBox("Training / Runtime Log")
         log_layout = QtWidgets.QVBoxLayout(self.log_group)
         log_layout.setContentsMargins(10, 10, 10, 10)
@@ -1135,6 +1264,11 @@ class EegMLWindow(QtWidgets.QDialog):
         self.pred_label.setStyleSheet("font-weight: 700;")
         self.conf_label.setStyleSheet("font-weight: 700;")
         self.latency_label.setStyleSheet(themed_label_style("muted"))
+        self.realtime_model_label.setStyleSheet(themed_label_style("muted"))
+        self.realtime_pred_label.setStyleSheet("font-size: 20px; font-weight: 700;")
+        self.realtime_conf_label.setStyleSheet("font-size: 18px; font-weight: 700;")
+        self.realtime_latency_label.setStyleSheet(themed_label_style("muted"))
+        self.realtime_rate_label.setStyleSheet(themed_label_style("muted"))
         self.collection_instruction_edit.setStyleSheet(
             f"QLineEdit {{ background-color: {THEME_COLORS['panel_alt']}; font-weight: 700; }}"
         )
@@ -1154,6 +1288,11 @@ class EegMLWindow(QtWidgets.QDialog):
             f"QPlainTextEdit {{ background-color: {THEME_COLORS['input_bg']}; "
             f"border: 1px solid {THEME_COLORS['border']}; border-radius: 10px; }}"
         )
+        self.realtime_meta_box.setFont(fixed_font)
+        self.realtime_meta_box.setStyleSheet(
+            f"QPlainTextEdit {{ background-color: {THEME_COLORS['input_bg']}; "
+            f"border: 1px solid {THEME_COLORS['border']}; border-radius: 8px; }}"
+        )
 
         button_styles = {
             self.terms_button: "muted",
@@ -1166,6 +1305,7 @@ class EegMLWindow(QtWidgets.QDialog):
             self.save_collection_config_button: "accent",
             self.train_button: "success",
             self.predict_toggle: "accent",
+            self.realtime_predict_toggle: "accent",
         }
         for button, kind in button_styles.items():
             button.setStyleSheet(themed_button_style(kind))
@@ -1185,6 +1325,35 @@ class EegMLWindow(QtWidgets.QDialog):
         self.train_group.setMinimumWidth(700)
         self.load_group.setMinimumWidth(700)
         self.log_group.setMinimumWidth(700)
+        self.realtime_group.setMinimumWidth(700)
+        for widget in [
+            self.train_input_edit,
+            self.model_output_root_edit,
+            self.run_name_edit,
+            self.model_file_edit,
+        ]:
+            widget.setTextMargins(8, 0, 8, 0)
+            widget.setFixedHeight(34)
+        for widget in [
+            self.window_ms_spin,
+            self.stride_ms_spin,
+            self.trees_spin,
+            self.depth_spin,
+            self.test_split_spin,
+            self.seed_spin,
+        ]:
+            widget.setFixedHeight(34)
+        for spin in [
+            self.window_ms_spin,
+            self.stride_ms_spin,
+            self.trees_spin,
+            self.depth_spin,
+            self.test_split_spin,
+            self.seed_spin,
+        ]:
+            spin.setFixedWidth(140)
+        self.train_button.setFixedWidth(240)
+        self.realtime_predict_toggle.setFixedWidth(240)
         self.contributor_edit.setMaximumWidth(420)
         self.protocol_labels_edit.setMaximumWidth(300)
         self.folder_name_edit.setMaximumWidth(180)
@@ -1581,6 +1750,7 @@ class EegMLWindow(QtWidgets.QDialog):
             self.collection_page.setVisible(True)
             self.train_group.setVisible(False)
             self.load_group.setVisible(False)
+            self.realtime_group.setVisible(False)
             self.log_group.setVisible(False)
             self.root_layout.setContentsMargins(14, 6, 14, 10)
             self.root_layout.setSpacing(0)
@@ -1599,13 +1769,15 @@ class EegMLWindow(QtWidgets.QDialog):
             self.collect_group.setVisible(False)
             self.train_group.setVisible(True)
             self.load_group.setVisible(False)
+            self.realtime_group.setVisible(False)
             self.log_group.setVisible(True)
             self.root_layout.setContentsMargins(18, 18, 18, 18)
             self.root_layout.setSpacing(14)
             self.top_grid.setColumnStretch(0, 0)
             self.top_grid.setColumnStretch(1, 1)
-            self.resize(900, 760)
-            self.setMinimumSize(840, 700)
+            self.metrics_box.setMinimumHeight(120)
+            self.resize(900, 640)
+            self.setMinimumSize(840, 600)
         elif mode == "load_model":
             self.setWindowTitle("EEG ML - Load Model")
             self.title_label.show()
@@ -1618,11 +1790,32 @@ class EegMLWindow(QtWidgets.QDialog):
             self.collect_group.setVisible(False)
             self.train_group.setVisible(False)
             self.load_group.setVisible(True)
+            self.realtime_group.setVisible(False)
             self.log_group.setVisible(True)
             self.root_layout.setContentsMargins(18, 18, 18, 18)
             self.root_layout.setSpacing(14)
             self.resize(900, 740)
             self.setMinimumSize(820, 680)
+        elif mode == "realtime_prediction":
+            self.setWindowTitle("Realtime Prediction")
+            self.title_label.show()
+            self.title_label.setText("Realtime Prediction")
+            self.subtitle_label.setVisible(True)
+            self.status_label.setVisible(True)
+            self.subtitle_label.setText("Run live EEG inference and watch class confidence update in real time.")
+            self.top_panel.setVisible(False)
+            self.collection_page.setVisible(False)
+            self.collect_group.setVisible(False)
+            self.train_group.setVisible(False)
+            self.load_group.setVisible(False)
+            self.realtime_group.setVisible(True)
+            self.log_group.setVisible(False)
+            self.root_layout.setContentsMargins(18, 18, 18, 18)
+            self.root_layout.setSpacing(14)
+            self.resize(900, 760)
+            self.setMinimumSize(820, 680)
+            self._refresh_realtime_model_status()
+            self._update_realtime_prediction_view(None)
         else:
             self.setWindowTitle("EEG ML Pipeline")
             self.title_label.show()
@@ -1635,6 +1828,7 @@ class EegMLWindow(QtWidgets.QDialog):
             self.collect_group.setVisible(True)
             self.train_group.setVisible(True)
             self.load_group.setVisible(True)
+            self.realtime_group.setVisible(False)
             self.log_group.setVisible(True)
             self.root_layout.setContentsMargins(18, 18, 18, 18)
             self.root_layout.setSpacing(14)
@@ -1655,8 +1849,11 @@ class EegMLWindow(QtWidgets.QDialog):
             self.prestart_timer.stop()
         if not self.streaming and self.protocol_running:
             self._stop_protocol("Protocol stopped because stream ended.")
-        if not self.streaming and self.predict_toggle.isChecked():
-            self.predict_toggle.setChecked(False)
+        if not self.streaming and self.prediction_enabled:
+            self.prediction_enabled = False
+            self._sync_prediction_toggles(False)
+            self.prediction_activity_changed.emit(False)
+            self._append_log("Live EEG prediction stopped because stream ended.")
         self._update_ui_state()
 
     def handle_incoming_chunk(
@@ -2204,35 +2401,70 @@ class EegMLWindow(QtWidgets.QDialog):
                     f"Model expects {bundle.channel_count} channels, but board currently has {self.channel_count}."
                 )
             self.model_bundle = bundle
+            self.loaded_model_path = path
             self.inference_worker.set_model_bundle(bundle)
             self.loaded_model_label.setText(
                 f"{Path(path).name} | {len(bundle.class_names)} classes | "
                 f"{bundle.window_samples} win / {bundle.stride_samples} stride"
             )
             self._reset_inference_ring()
+            self._refresh_realtime_model_status()
+            self._update_realtime_prediction_view(None)
             self._append_log(f"Model loaded: {path}")
+            self.model_loaded.emit(self)
         except Exception as exc:  # pylint: disable=broad-except
             self._append_log(f"Failed to load model: {exc}")
 
         self._update_ui_state()
 
+    def adopt_model_from(self, other: "EegMLWindow") -> bool:
+        if other is None or other.model_bundle is None:
+            return False
+        self.model_bundle = other.model_bundle
+        self.loaded_model_path = str(getattr(other, "loaded_model_path", "") or other.model_path_edit.text().strip())
+        self.inference_worker.set_model_bundle(self.model_bundle)
+        if self.loaded_model_path:
+            self.model_path_edit.setText(self.loaded_model_path)
+        self.loaded_model_label.setText(
+            f"{Path(self.loaded_model_path).name or 'Loaded model'} | {len(self.model_bundle.class_names)} classes | "
+            f"{self.model_bundle.window_samples} win / {self.model_bundle.stride_samples} stride"
+        )
+        self._reset_inference_ring()
+        self._refresh_realtime_model_status()
+        self._update_realtime_prediction_view(None)
+        self._update_ui_state()
+        return True
+
+    def _sync_prediction_toggles(self, checked: bool) -> None:
+        for button in [self.predict_toggle, self.realtime_predict_toggle]:
+            button.blockSignals(True)
+            button.setChecked(bool(checked))
+            button.setText("Stop Live Prediction" if checked else "Start Live Prediction")
+            button.blockSignals(False)
+
     def _on_predict_toggled(self, checked: bool) -> None:
         if checked:
             if not self.streaming:
                 self._append_log("Cannot start prediction: stream is not running.")
-                self.predict_toggle.setChecked(False)
+                self._sync_prediction_toggles(False)
                 return
             if self.model_bundle is None:
                 self._append_log("Cannot start prediction: no model loaded.")
-                self.predict_toggle.setChecked(False)
+                self._sync_prediction_toggles(False)
                 return
+            if not self.inference_worker.isRunning():
+                self.inference_worker.start()
             self.prediction_enabled = True
             self._samples_since_submit = 0
-            self.predict_toggle.setText("Stop Live Prediction")
+            self._last_prediction_ts = 0.0
+            self._prediction_rate_hz = 0.0
+            self._sync_prediction_toggles(True)
+            self.prediction_activity_changed.emit(True)
             self._append_log("Live EEG prediction started.")
         else:
             self.prediction_enabled = False
-            self.predict_toggle.setText("Start Live Prediction")
+            self._sync_prediction_toggles(False)
+            self.prediction_activity_changed.emit(False)
             self._append_log("Live EEG prediction stopped.")
         self._update_ui_state()
 
@@ -2240,9 +2472,80 @@ class EegMLWindow(QtWidgets.QDialog):
         self.pred_label.setText(str(result.get("label", "N/A")))
         self.conf_label.setText(f"{100.0 * float(result.get('confidence', 0.0)):.1f}%")
         self.latency_label.setText(f"{float(result.get('latency_ms', 0.0)):.1f} ms")
+        now_ts = time.perf_counter()
+        if self._last_prediction_ts > 0.0:
+            inst_rate = 1.0 / max(1e-6, now_ts - self._last_prediction_ts)
+            if self._prediction_rate_hz > 0.0:
+                self._prediction_rate_hz = (0.70 * self._prediction_rate_hz) + (0.30 * inst_rate)
+            else:
+                self._prediction_rate_hz = inst_rate
+        self._last_prediction_ts = now_ts
+        self._update_realtime_prediction_view(result)
 
     def _on_prediction_error(self, message: str) -> None:
         self._append_log(f"Inference error: {message}")
+
+    def _refresh_realtime_model_status(self) -> None:
+        if self.model_bundle is None:
+            self.realtime_model_label.setText("Model: Not loaded")
+            self.realtime_model_label.setStyleSheet(themed_label_style("muted"))
+            self.realtime_meta_box.setPlainText("Load a model from the Load Model or Train Model window first.")
+            return
+
+        model_name = Path(self.loaded_model_path).name if self.loaded_model_path else "Loaded model"
+        self.realtime_model_label.setText(f"Model: {model_name}")
+        self.realtime_model_label.setStyleSheet(themed_label_style("success"))
+        model_path = self.loaded_model_path or "N/A"
+        self.realtime_meta_box.setPlainText(
+            "\n".join(
+                [
+                    f"Model path: {model_path}",
+                    f"Sample rate: {self.model_bundle.sample_rate} Hz",
+                    f"Window samples: {self.model_bundle.window_samples}",
+                    f"Stride samples: {self.model_bundle.stride_samples}",
+                    f"Input channels: {self.model_bundle.channel_count}",
+                    f"Classes: {', '.join(self.model_bundle.class_names)}",
+                ]
+            )
+        )
+
+    def _update_realtime_prediction_view(self, result: dict | None) -> None:
+        classes = self.model_bundle.class_names if self.model_bundle is not None else []
+        if not classes:
+            classes = ["N/A"]
+            scores = np.asarray([0.0], dtype=np.float32)
+        else:
+            raw_scores = [] if result is None else list(result.get("probabilities", []))
+            scores = np.asarray(raw_scores, dtype=np.float32)
+            if scores.size != len(classes):
+                scores = np.zeros(len(classes), dtype=np.float32)
+
+        label = "N/A" if result is None else str(result.get("label", "N/A"))
+        confidence = 0.0 if result is None else 100.0 * float(result.get("confidence", 0.0))
+        latency = 0.0 if result is None else float(result.get("latency_ms", 0.0))
+
+        self.realtime_pred_label.setText(f"Prediction: {label}")
+        self.realtime_conf_label.setText(f"Confidence: {confidence:.1f}%")
+        self.realtime_latency_label.setText(f"Latency: {latency:.1f} ms" if result is not None else "Latency: N/A")
+        self.realtime_rate_label.setText(f"Rate: {max(0.0, self._prediction_rate_hz):.1f}/sec")
+
+        x = np.arange(1, len(classes) + 1, dtype=np.float32)
+        if self._prediction_bar_item is not None:
+            try:
+                self.realtime_bar_plot.removeItem(self._prediction_bar_item)
+            except Exception:
+                pass
+        self._prediction_bar_item = pg.BarGraphItem(
+            x=x,
+            height=np.clip(scores * 100.0, 0.0, 100.0),
+            width=0.62,
+            brush=pg.mkBrush(THEME_COLORS["success"] if result is not None else THEME_COLORS["accent"]),
+            pen=pg.mkPen(THEME_COLORS["border"]),
+        )
+        self.realtime_bar_plot.addItem(self._prediction_bar_item)
+        ticks = [(idx + 1, str(name)) for idx, name in enumerate(classes)]
+        self.realtime_bar_plot.getAxis("bottom").setTicks([ticks])
+        self.realtime_bar_plot.setXRange(0.4, len(classes) + 0.6, padding=0.0)
 
     def _reset_inference_ring(self) -> None:
         capacity = max(int(self.sample_rate * 10), 512)
@@ -2310,7 +2613,9 @@ class EegMLWindow(QtWidgets.QDialog):
             self.protocol_rest_spin.setEnabled(not self.protocol_running)
             self.protocol_repeats_spin.setEnabled(not self.protocol_running)
         self.train_button.setEnabled(self.train_worker is None or not self.train_worker.isRunning())
-        self.predict_toggle.setEnabled(self.streaming and self.model_bundle is not None)
+        prediction_ready = self.streaming and self.model_bundle is not None
+        self.predict_toggle.setEnabled(prediction_ready)
+        self.realtime_predict_toggle.setEnabled(prediction_ready)
         status = f"Connected={self.connected} | Streaming={self.streaming} | SR={self.sample_rate} | CH={self.channel_count}"
         self.status_label.setText(f"Status: {status}")
         if self.protocol_running:
